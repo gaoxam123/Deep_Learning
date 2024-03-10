@@ -51,7 +51,7 @@ def train(model, loader, optimizer, loss_fn, scaler, epoch, num_epochs, multi_sc
         with torch.cuda.amp.autocast():
             out = model(images)
             loss = loss_fn(out, targets)
-            batch_loss += loss
+            loss_epoch += loss
 
         scaler.scale(loss).backward()
 
