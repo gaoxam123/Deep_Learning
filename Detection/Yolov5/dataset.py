@@ -15,7 +15,7 @@ def resize_image(image, output_size):
     return cv2.resize(image, dsize=output_size, interpolation=cv2.INTER_LINEAR)
 
 class Training_Dataset(Dataset):
-    def __init__(self, root_dir=config.ROOT_DIR, transform=None, train=True, rect_training=False, default_size=640, batch_size=32, boxes_format='coco'):
+    def __init__(self, root_dir=config.ROOT_DIR, transform=None, train=True, rect_training=False, default_size=640, batch_size=32, boxes_format='pascal_voc'):
         super().__init__()
         self.batch_size = batch_size
         self.batch_range = 64
@@ -73,8 +73,8 @@ class Training_Dataset(Dataset):
             augmentations = self.transform(image=image, bboxes=np.roll(labels, shift=4, axis=1))
             image = augmentations["image"]
             labels = np.array(augmentations["bboxes"])
-            if len(labels):
-                labels = np.roll(labels, shift=1, axis=1)
+            # if len(labels):
+            #     labels = np.roll(labels, shift=1, axis=1)
 
         image = image.permute(2, 0, 1)
         image = np.ascontiguousarray(image)
@@ -82,7 +82,7 @@ class Training_Dataset(Dataset):
         return torch.tensor(image), labels
     
 class Validation_Dataset(Dataset):
-    def __init__(self, root_dir, anchors, transform=None, train=True, S=(8, 16, 32), rect_training=False, default_size=640, batch_size=32, boxes_format='coco'):
+    def __init__(self, root_dir, anchors, transform=None, train=True, S=(8, 16, 32), rect_training=False, default_size=640, batch_size=32, boxes_format='pascal_voc'):
         super().__init__()
         self.batch_range = 64
         self.batch_size = batch_size
@@ -146,13 +146,13 @@ class Validation_Dataset(Dataset):
             augmentations = self.transform(image=image, bboxes=np.roll(labels, shift=4, axis=1))
             image = augmentations["image"]
             labels = np.array(augmentations["bboxes"])
-            if len(labels):
-                labels = np.roll(labels, shift=1, axis=1)
+            # if len(labels):
+            #     labels = np.roll(labels, shift=1, axis=1)
 
         targets = [torch.zeros(self.num_anchors_per_scale, int(image.shape[0] / S), int(image.shape[1] / S), 6) for S in self.S]
 
         for box in labels:
-            iou_anchors = iou_width_height(box[3:5], self.anchors)
+            iou_anchors = iou_width_height(torch.tensor(box[3:5]), self.anchors)
             anchor_indices = iou_anchors.argsort(descending=True, dim=0)
             class_label, x, y, width, height = box
             has_anchor = [False, False, False]
