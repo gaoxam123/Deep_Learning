@@ -46,7 +46,7 @@ class YoloLoss():
         targets = [torch.zeros(self.num_anchors_per_scale, preds[i].shape[2], preds[i].shape[3], 6) for i in range(len(self.S))]
 
         for box in boxes:
-            iou_anchors = iou_width_height(box[2:4], self.anchors_d)
+            iou_anchors = iou_width_height(torch.tensor(box[2:4]), self.anchors_d)
             anchor_indices = iou_anchors.argsort(descending=True, dim=0)
             x, y, width, height, class_label = box
             has_anchors = [False, False, False]
