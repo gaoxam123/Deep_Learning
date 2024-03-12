@@ -85,7 +85,7 @@ class RPN(nn.Module):
 
         gt_boxes_proj = project_gt_boxes(gt_boxes, self.width_scale_factor, self.height_scale_factor, mode='p2a')
 
-        pos_anchor_index, neg_anchor_index, GT_confidence_score, GT_offsets, GT_class_pos, pos_anchor_coords, neg_anchor_coords, pos_anchor_index_seperate = get_req_anchors(anchor_boxes, gt_boxes_proj, gt_classes)
+        pos_anchor_index, neg_anchor_index, GT_confidence_score, GT_offsets, GT_class_pos, pos_anchor_coords, neg_anchor_coords, pos_anchor_index_seperate, max_iou_per_anchor_index, total_boxes = get_req_anchors(anchor_boxes, gt_boxes_proj, gt_classes)
 
         confidence_score_pos, confidence_score_neg, offsets_pos, proposals = self.proposal_module(feature_map, pos_anchor_index, neg_anchor_index, pos_anchor_coords)
         
@@ -94,7 +94,7 @@ class RPN(nn.Module):
 
         total_rpn_loss = self.weight_confidence * cls_loss + self.weight_regression * reg_loss
 
-        return total_rpn_loss, feature_map, proposals, pos_anchor_index_seperate, GT_class_pos, self.width_scale_factor, self.height_scale_factor
+        return total_rpn_loss, feature_map, proposals, pos_anchor_index_seperate, GT_class_pos, self.width_scale_factor, self.height_scale_factor, max_iou_per_anchor_index, total_boxes, pos_anchor_index
     
     def inference(self, images, conf_thresh=0.5, nms_thresh=0.7):
         with torch.no_grad():
@@ -130,7 +130,7 @@ class RPN(nn.Module):
                 proposals_final.append(proposals_pos)
                 confidence_score_final.append(confidence_score_pos)
                 
-        return proposals_final, confidence_score_final, feature_map
+        return proposals_final, confidence_score_final, feature_map, self.width_scale_factor, self.height_scale_factor
     
 class Classification(nn.Module):
     def __init__(self, out_channels, n_classes, roi_size, hidden_dim=512, dropout_p=0.3):
@@ -144,7 +144,7 @@ class Classification(nn.Module):
         self.cls_head = nn.Linear(hidden_dim, n_classes)
         self.reg_head = nn.Linear(hidden_dim, 4)
 
-    def forward(self, feature_map, proposal_list, width_scale_factor, height_scale_factor, gt_classes=None):
+    def forward(self, feature_map, proposal_list, width_scale_factor, height_scale_factor, gt_boxes=None, gt_classes=None, max_iou_per_anchor_index=None, total_boxes=None, pos_anchor_index=None):
         if gt_classes is None:
             mode = 'eval'
 
@@ -165,14 +165,36 @@ class Classification(nn.Module):
         # project proposal to image size
         proposal_list = project_gt_boxes(proposal_list, width_scale_factor, height_scale_factor, 'a2p')
 
+        # proposal_list: num_proposals x 4 <-> batch x num_props_per_img x 4
+        # gt_boxes: batch x max_objs x 4
+        # pos_anc_idx_sep: batch_idx of proposals
+        # pos_anc_idx: batch * num_pos_per_img
+        # max_iou_per_anc_idx: batch x num_anc_per_img
+        # GT_boxes_pos: gt_boxes for each proposals
+
         # find corresponding gt_boxes for each proposals
+        # use the same way to find gt_boxes for all anchors then extract the pos examples using pos_anchor_index from the RPN
+        
+        N = gt_boxes.shape[1]
+        B = feature_map.shape[0]
+
+        gt_boxes_expand = gt_boxes.view(B, 1, N, 4).expand(B, total_boxes, N, 4)
+        GT_boxes = torch.gather(gt_boxes_expand, dim=-2, index=max_iou_per_anchor_index.reshape(B, total_boxes, 1, 1).repeat(1, 1, 1, 4))
+        GT_boxes = GT_boxes.flatten(start_dim=0, end_dim=2)
+        GT_boxes_pos = GT_boxes[pos_anchor_index]
+        
+        # calculate second offsets
+        GT_offsets = cal_gt_offsets(proposal_list, GT_boxes_pos)
 
         if mode == 'eval':
-            return cls_scores
+            return cls_scores, reg_offsets
         
         cls_loss = F.cross_entropy(cls_scores, gt_classes.long())
+        # second box_loss (regression on image)
+        box_loss = calc_box_loss(GT_offsets, proposal_list, B)
 
-        return cls_loss
+        # add weight to make sure the model learns the most accurate bboxes
+        return cls_loss + 5 * box_loss
     
 class FasterRCNN(nn.Module):
     def __init__(self, img_size, out_size, out_channels, n_classes, roi_size):
@@ -181,7 +203,7 @@ class FasterRCNN(nn.Module):
         self.classifier = Classification(out_channels, n_classes, roi_size)
 
     def forward(self, images, gt_boxes, gt_classes):
-        total_rpn_loss, feature_map, proposals, pos_anchor_index_seperate, GT_class_pos, width_scale_factor, height_scale_factor = self.rpn(images, gt_boxes, gt_classes)
+        total_rpn_loss, feature_map, proposals, pos_anchor_index_seperate, GT_class_pos, width_scale_factor, height_scale_factor, max_iou_per_anchor_index, total_boxes, pos_anchor_index = self.rpn(images, gt_boxes, gt_classes)
 
         pos_proposal_list = []
         batch_size = images.shape[0]
@@ -191,15 +213,21 @@ class FasterRCNN(nn.Module):
             proposal_seperate = proposals[proposal_index].detach().clone()
             pos_proposal_list.append(proposal_seperate)
 
-        cls_loss = self.classifier(feature_map, pos_proposal_list, width_scale_factor, height_scale_factor, GT_class_pos)
-        total_loss = cls_loss + total_rpn_loss
+        # box_loss and class_loss combined
+        total_classification_loss = self.classifier(feature_map, pos_proposal_list, width_scale_factor, height_scale_factor, gt_boxes, GT_class_pos, max_iou_per_anchor_index, total_boxes, pos_anchor_index)
+        total_loss = total_classification_loss + total_rpn_loss
 
         return total_loss
 
     def inference(self, images, conf_thresh=0.5, nms_thresh=0.7):
         batch_size = images.shape[0]
-        proposals_final, confidence_score_final, feature_map = self.rpn.inference(images, conf_thresh, nms_thresh)
-        cls_scores = self.classifier(feature_map, proposals_final)
+        proposals_final, confidence_score_final, feature_map, width_scale_factor, height_scale_factor = self.rpn.inference(images, conf_thresh, nms_thresh)
+        cls_scores, reg_offsets = self.classifier(feature_map, proposals_final)
+
+        # project the proposals from RPN(which is on feature map scale) onto the original image
+        proposals_final = project_gt_boxes(proposals_final, width_scale_factor, height_scale_factor, 'a2p')
+        # generate correct bboxes using offsets from the classifier
+        proposals_final = generate_proposals(proposals_final, reg_offsets)
 
         cls_probs = F.softmax(cls_scores, dim=-1)
         classes = torch.argmax(cls_probs, dim=-1)
@@ -213,84 +241,3 @@ class FasterRCNN(nn.Module):
             index += n_proposals
 
         return proposals_final, confidence_score_final, classes_final
-    
-class MaskHead(nn.Module):
-    def __init__(self, in_channels, mid_channels=256, out_channels=81):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, feature_map):
-        out = self.relu(self.conv1(feature_map))
-        out = self.conv2(out)
-        return out
-    
-class MaskRCNN(nn.Module):
-    def __init__(self, img_size, out_size, out_channels, n_classes, roi_size):
-        super().__init__()
-        self.rpn = RPN(img_size, out_size, out_channels)
-        self.classifier = Classification(out_channels, n_classes, roi_size)
-        self.mask_head = MaskHead(out_channels)
-        self.bbox_head = nn.Linear(out_channels, 4)  # 4 coordinates for bounding box
-
-    def forward(self, images, gt_boxes, gt_classes):
-        total_rpn_loss, feature_map, proposals, pos_anchor_index_separate, GT_class_pos = self.rpn(images, gt_boxes,
-                                                                                                    gt_classes)
-
-        pos_proposal_list = []
-        batch_size = images.shape[0]
-
-        for i in range(batch_size):
-            proposal_index = torch.where(pos_anchor_index_separate == i)[0]
-            proposal_separate = proposals[proposal_index].detach().clone()
-            pos_proposal_list.append(proposal_separate)
-
-        cls_loss = self.classifier(feature_map, pos_proposal_list, GT_class_pos)
-        
-        # Bounding box regression
-        bbox_losses = []
-        for i in range(batch_size):
-            pos_proposals_batch = pos_proposal_list[i]
-            proposal_features = ops.roi_pool(feature_map[i].unsqueeze(0), pos_proposals_batch, self.roi_size)
-            proposal_features = proposal_features.view(proposal_features.size(0), -1)
-            bbox_preds = self.bbox_head(proposal_features)
-            bbox_targets = gt_boxes[i][pos_anchor_index_separate == i]
-            bbox_loss = F.smooth_l1_loss(bbox_preds, bbox_targets)
-            bbox_losses.append(bbox_loss)
-        
-        total_bbox_loss = torch.stack(bbox_losses).mean()
-
-        total_loss = cls_loss + total_rpn_loss + total_bbox_loss
-
-        return total_loss
-
-    def inference(self, images, conf_thresh=0.5, nms_thresh=0.7):
-        batch_size = images.shape[0]
-        proposals_final, confidence_score_final, feature_map = self.rpn.inference(images, conf_thresh, nms_thresh)
-        cls_scores = self.classifier(feature_map, proposals_final)
-
-        cls_probs = F.softmax(cls_scores, dim=-1)
-        classes = torch.argmax(cls_probs, dim=-1)
-
-        classes_final = []
-        index = 0
-
-        for i in range(batch_size):
-            n_proposals = len(proposals_final[i])
-            classes_final.append(classes[index: index + n_proposals])
-            index += n_proposals
-
-        masks = []
-        bboxes = []
-        for proposal, feature in zip(proposals_final, feature_map):
-            roi_pooled_features = ops.roi_align(feature.unsqueeze(0), proposal, output_size=(self.mask_head.conv1.out_channels, self.mask_head.conv1.out_channels))
-            mask_preds = self.mask_head(roi_pooled_features)
-            masks.append(mask_preds)
-            
-            proposal_features = ops.roi_pool(feature.unsqueeze(0), proposal, self.roi_size)
-            proposal_features = proposal_features.view(proposal_features.size(0), -1)
-            bbox_preds = self.bbox_head(proposal_features)
-            bboxes.append(bbox_preds)
-
-        return proposals_final, confidence_score_final, classes_final, masks, bboxes

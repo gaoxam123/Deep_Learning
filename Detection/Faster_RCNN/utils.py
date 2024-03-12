@@ -136,7 +136,7 @@ def get_req_anchors(anchor_boxes, gt_boxes, gt_classes, pos_thresh=0.7, neg_thre
     neg_anchor_index = neg_anchor_index[torch.randint(0, neg_anchor_index.shape[0], pos_anchor_index.shape[0])]
     neg_anchor_coords = anchor_boxes_flat[neg_anchor_index]
 
-    return pos_anchor_index, neg_anchor_index, GT_confidence_score, GT_offsets, GT_class_pos, pos_anchor_coords, neg_anchor_coords, pos_anchor_index_seperate
+    return pos_anchor_index, neg_anchor_index, GT_confidence_score, GT_offsets, GT_class_pos, pos_anchor_coords, neg_anchor_coords, pos_anchor_index_seperate, max_iou_per_anchor_index, total_boxes
 
 def generate_proposals(anchors, offsets):
     anchors = ops.box_convert(anchors, in_fmt='xyxy', out_fmt='cxcywh')
