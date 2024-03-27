@@ -113,6 +113,7 @@ class RPN(nn.Module):
             proposals_final = []
             confidence_score_final = []
 
+            # only perform nms after the second stage
             for i in range(batch_size):
                 confidence_score = torch.sigmoid(confidence_score_preds[i])
                 offsets = offsets_preds[i]
@@ -122,10 +123,10 @@ class RPN(nn.Module):
                 confidence_index = torch.where(confidence_score >= conf_thresh)[0]
                 confidence_score_pos = confidence_score[confidence_index]
                 proposals_pos = proposals[confidence_index]
-                # filter based on nms threshold
-                nms_index = ops.nms(proposals_pos, confidence_score_pos, nms_thresh)
-                confidence_score_pos = confidence_score_pos[nms_index]
-                proposals_pos = proposals_pos[nms_index]
+                # # filter based on nms threshold
+                # nms_index = ops.nms(proposals_pos, confidence_score_pos, nms_thresh)
+                # confidence_score_pos = confidence_score_pos[nms_index]
+                # proposals_pos = proposals_pos[nms_index]
 
                 proposals_final.append(proposals_pos)
                 confidence_score_final.append(confidence_score_pos)
@@ -159,13 +160,16 @@ class Classification(nn.Module):
         out = self.fc(roi_out)
         out = self.relu(self.dropout(out))
 
-        cls_scores = self.cls_head(out)
+        cls_scores = self.cls_head(out) # batch_size x num_proposals x n_classes
         reg_offsets = self.reg_head(out)
 
         # project proposal to image size
         proposal_list = project_gt_boxes(proposal_list, width_scale_factor, height_scale_factor, 'a2p')
 
-        # proposal_list: num_proposals x 4 <-> batch x num_props_per_img x 4
+        # batch x num_props_per_img x 4 -> num x 4
+        proposal_list = proposal_list.flatten(start_dim=0, end_dim=1)
+
+        # proposal_list: num x 4
         # gt_boxes: batch x max_objs x 4
         # pos_anc_idx_sep: batch_idx of proposals
         # pos_anc_idx: batch * num_pos_per_img
@@ -221,15 +225,36 @@ class FasterRCNN(nn.Module):
 
     def inference(self, images, conf_thresh=0.5, nms_thresh=0.7):
         batch_size = images.shape[0]
-        proposals_final, confidence_score_final, feature_map, width_scale_factor, height_scale_factor = self.rpn.inference(images, conf_thresh, nms_thresh)
-        cls_scores, reg_offsets = self.classifier(feature_map, proposals_final)
+        proposals_rpn, confidence_score_rpn, feature_map, width_scale_factor, height_scale_factor = self.rpn.inference(images, conf_thresh, nms_thresh)
+        cls_scores, reg_offsets = self.classifier(feature_map, proposals_rpn)
 
         # project the proposals from RPN(which is on feature map scale) onto the original image
-        proposals_final = project_gt_boxes(proposals_final, width_scale_factor, height_scale_factor, 'a2p')
+        proposals_rpn = project_gt_boxes(proposals_rpn, width_scale_factor, height_scale_factor, 'a2p')
         # generate correct bboxes using offsets from the classifier
-        proposals_final = generate_proposals(proposals_final, reg_offsets)
+        proposals_rpn = generate_proposals(proposals_rpn, reg_offsets)
 
-        cls_probs = F.softmax(cls_scores, dim=-1)
+        # proposals_rpn batch x num_per_img x 4
+        # perform nms
+
+        proposals_final = []
+        confidence_score_final = []
+        cls_scores_final = []
+
+        for i in range(proposals_rpn.shape[0]):
+            # filter based on nms threshold
+            proposals_pos = proposals_rpn[i]
+            confidence_score_pos = confidence_score_rpn[i]
+            cls_scores_pos = cls_scores[i]
+            nms_index = ops.nms(proposals_pos, confidence_score_pos, nms_thresh)
+            confidence_score_pos = confidence_score_pos[nms_index]
+            proposals_pos = proposals_pos[nms_index]
+            cls_scores_pos = cls_scores_pos[nms_index]
+
+            proposals_final.append(proposals_pos)
+            confidence_score_final.append(confidence_score_pos)
+            cls_scores_final.append(cls_scores_pos)
+
+        cls_probs = F.softmax(cls_scores_final, dim=-1)
         classes = torch.argmax(cls_probs, dim=-1)
 
         classes_final = []

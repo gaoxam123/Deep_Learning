@@ -3,26 +3,24 @@ from torch.utils.data import DataLoader
 from model import *
 from loss import *
 from utils import *
+from dataset import *
 import torch.optim as optim
 import torch.nn as nn
 from tqdm.auto import tqdm
 
-def train(loader, model, learning_rate, epochs):
-    optimizer = optim.Adam(params=model.parameters(), lr=learning_rate)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model.train()
-    loss_list = []
+df = pd.read_csv('train.csv')
+train_idx, val_idx = train_test_split(df.image_id.unique(), train_size=0.7, random_state=23)
+train_df, val_df = df[df['image_id'].isin(train_idx)], df[df['image_id'].isin(val_idx)]
 
-    for i in tqdm(range(epochs)):
-        total_loss = 0
-        for images, gt_boxes, gt_classes in loader:
-            loss = model(images, gt_boxes, gt_classes)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+train_dataset = FasterRCNNDataset(train_df, 'train', train_transform)
+val_dataset = FasterRCNNDataset(val_df, 'train', val_transform)
 
-            total_loss += loss.item()
-        
-        loss_list.append(total_loss)
+train_dataloader = DataLoader(train_dataset, batch_size=4, collate_fn=train_dataset.collate_fn, drop_last=True)
+val_dataloader = DataLoader(val_dataset, batch_size=4, collate_fn=val_dataset.collate_fn, drop_last=True)
 
-    return loss_list
+model = FasterRCNN().to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.00001)
+num_epochs = 20
+
